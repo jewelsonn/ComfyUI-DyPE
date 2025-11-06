@@ -130,7 +130,7 @@ def is_nunchaku_flux_model(model):
     
     return False
 
-def create_nunchaku_forward_wrapper(wrapper_instance, pe_embedder, enable_dype=True, debug=False):
+def create_nunchaku_forward_wrapper(wrapper_instance, pe_embedder, enable_dype=True, debug=False, optimize=True):
     """
     Create a wrapper for ComfyFluxWrapper.forward that applies DyPE to generated img_ids.
     
@@ -141,6 +141,7 @@ def create_nunchaku_forward_wrapper(wrapper_instance, pe_embedder, enable_dype=T
         pe_embedder: The DyPE positional embedder
         enable_dype: Whether DyPE is enabled
         debug: Enable verbose debug logging (default: False for silent operation)
+        optimize: Enable performance optimizations (default: True)
     """
     import torch
     from comfy.ldm.common_dit import pad_to_patch_size
@@ -218,33 +219,45 @@ def create_nunchaku_forward_wrapper(wrapper_instance, pe_embedder, enable_dype=T
             # Apply DyPE enhancement to img_ids
             if enable_dype:
                 try:
-                    _debug_print(f"🎯 DyPE: Applying DyPE enhancement to img_ids")
-                    
-                    # Get DyPE enhanced embeddings
-                    dype_embeddings = pe_embedder(img_ids)
-                    
-                    # Apply frequency scaling based on DyPE timestep and embeddings
-                    freq_scale = 1.0
-                    if hasattr(pe_embedder, 'current_timestep'):
-                        timestep_norm = pe_embedder.current_timestep
-                        base_freq = 1.0 + 0.05 * timestep_norm  # Conservative scaling
-                        
-                        # Scale based on the actual DyPE embedding variance
-                        dype_variance = dype_embeddings.var().item()
-                        img_variance = img_ids.var().item()
-                        if img_variance > 0:
-                            freq_scale = base_freq * (1.0 + 0.1 * timestep_norm * dype_variance / (img_variance + 1e-8))
-                    
-                    # Apply frequency scaling to Y and X spatial coordinates only
-                    if img_ids.shape[-1] >= 3:
+                    # PERFORMANCE OPTIMIZATION: Skip heavy computations for small images
+                    if optimize and img_ids.numel() < 4096:  # Small image threshold
+                        # For small images, use minimal processing
                         enhanced_img_ids = img_ids.clone()
-                        enhanced_img_ids[..., 1:3] = enhanced_img_ids[..., 1:3] * freq_scale
-                        
-                        _debug_print(f"🎯 DyPE: Applied frequency scaling (scale={freq_scale:.3f}) to spatial coordinates")
-                        _debug_print(f"🎯 DyPE: Enhanced img_ids max_pos={enhanced_img_ids.max().item():.1f}")
-                        
-                        # Use the enhanced img_ids
+                        if hasattr(pe_embedder, 'current_timestep'):
+                            timestep_norm = pe_embedder.current_timestep
+                            if timestep_norm > 0.1:  # Only apply for significant timesteps
+                                freq_scale = 1.0 + 0.02 * timestep_norm  # Lighter scaling for small images
+                                enhanced_img_ids[..., 1:3] = enhanced_img_ids[..., 1:3] * freq_scale
                         img_ids = enhanced_img_ids
+                    else:
+                        # Full processing for larger images
+                        _debug_print(f"🎯 DyPE: Applying DyPE enhancement to img_ids")
+                        
+                        # Get DyPE enhanced embeddings
+                        dype_embeddings = pe_embedder(img_ids)
+                        
+                        # Apply frequency scaling based on DyPE timestep and embeddings
+                        freq_scale = 1.0
+                        if hasattr(pe_embedder, 'current_timestep'):
+                            timestep_norm = pe_embedder.current_timestep
+                            base_freq = 1.0 + 0.05 * timestep_norm  # Conservative scaling
+                            
+                            # Scale based on the actual DyPE embedding variance
+                            dype_variance = dype_embeddings.var().item()
+                            img_variance = img_ids.var().item()
+                            if img_variance > 0:
+                                freq_scale = base_freq * (1.0 + 0.1 * timestep_norm * dype_variance / (img_variance + 1e-8))
+                        
+                        # Apply frequency scaling to Y and X spatial coordinates only
+                        if img_ids.shape[-1] >= 3:
+                            enhanced_img_ids = img_ids.clone()
+                            enhanced_img_ids[..., 1:3] = enhanced_img_ids[..., 1:3] * freq_scale
+                            
+                            _debug_print(f"🎯 DyPE: Applied frequency scaling (scale={freq_scale:.3f}) to spatial coordinates")
+                            _debug_print(f"🎯 DyPE: Enhanced img_ids max_pos={enhanced_img_ids.max().item():.1f}")
+                            
+                            # Use the enhanced img_ids
+                            img_ids = enhanced_img_ids
                         
                 except Exception as e:
                     # Keep error logging but make it conditional on debug flag
@@ -325,7 +338,9 @@ def apply_dype_to_flux(model: ModelPatcher, width: int, height: int, method: str
             latent_h, latent_w = height // 8, width // 8
             padded_h, padded_w = math.ceil(latent_h / patch_size) * patch_size, math.ceil(latent_w / patch_size) * patch_size
             image_seq_len = (padded_h // patch_size) * (padded_w // patch_size)
-            base_seq_len, max_seq_len = 256, 4096
+            base_seq_len = 256
+            # CRITICAL FIX: Use image_seq_len as max_seq_len (matches original DyPE)
+            max_seq_len = image_seq_len
             slope = (max_shift - base_shift) / (max_seq_len - base_seq_len)
             intercept = base_shift - slope * base_seq_len
             dype_shift = image_seq_len * slope + intercept
@@ -429,7 +444,7 @@ def apply_dype_to_flux(model: ModelPatcher, width: int, height: int, method: str
         from .nunchaku_compat import create_nunchaku_dype_wrapper
         
         # Create enhanced forward method
-        enhanced_forward = create_nunchaku_forward_wrapper(wrapper, new_pe_embedder, enable_dype, debug=False)
+        enhanced_forward = create_nunchaku_forward_wrapper(wrapper, new_pe_embedder, enable_dype, debug=False, optimize=True)
         
         # Replace the forward method of the wrapper
         wrapper.forward = types.MethodType(enhanced_forward, wrapper)

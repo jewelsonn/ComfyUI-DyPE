@@ -11,7 +11,7 @@ def _debug_print(*args, **kwargs):
     if NUNCHAKU_DYPE_DEBUG:
         print(*args, **kwargs)
 
-def create_nunchaku_dype_wrapper(original_function, pe_embedder, enable_dype=True, model_config=None, debug=False):
+def create_nunchaku_dype_wrapper(original_function, pe_embedder, enable_dype=True, model_config=None, debug=False, optimize=True):
     """
     Create a specialized wrapper function for Nunchaku FLUX models with DyPE integration.
     
@@ -24,6 +24,7 @@ def create_nunchaku_dype_wrapper(original_function, pe_embedder, enable_dype=Tru
         enable_dype: Whether DyPE is enabled
         model_config: The Nunchaku model configuration dict
         debug: Enable verbose debug logging (default: False for silent operation)
+        optimize: Enable performance optimizations (default: True)
         
     Returns:
         Wrapper function that applies DyPE correctly for Nunchaku models
@@ -96,34 +97,23 @@ def create_nunchaku_dype_wrapper(original_function, pe_embedder, enable_dype=Tru
             # CRITICAL FIX: Apply DyPE positional embeddings to img_ids before passing to Nunchaku model
             if enable_dype and img_ids is not None:
                 try:
-                    _debug_print(f"🔥 DyPE WRAPPER: Applying DyPE embeddings to img_ids")
-                    
-                    # Apply DyPE positional embeddings to the image IDs
-                    dype_embeddings = pe_embedder(img_ids)
-                    
-                    # CRITICAL FIX: Properly inject DyPE embeddings into the positional encoding system
-                    # Instead of keeping original img_ids, we enhance them with DyPE frequency adjustments
-                    enhanced_img_ids = img_ids.clone()
-                    
-                    # Apply DyPE frequency scaling to maintain text-image alignment
-                    if dype_embeddings.numel() == enhanced_img_ids.numel() * 2:  # cos/sin pairs
-                        # Calculate frequency scaling based on DyPE timestep and embeddings
-                        freq_scale = 1.0
-                        if hasattr(pe_embedder, 'current_timestep'):
-                            timestep_norm = pe_embedder.current_timestep
-                            # Apply time-dependent frequency adjustment that preserves text conditioning
-                            # The key is to scale positional frequencies while maintaining coordinate structure
-                            base_freq = 1.0 + 0.05 * timestep_norm  # Conservative scaling
-                            # Scale based on the actual DyPE embedding variance to avoid over-modification
-                            dype_variance = dype_embeddings.var().item()
-                            img_variance = enhanced_img_ids.var().item()
-                            if img_variance > 0:
-                                freq_scale = base_freq * (1.0 + 0.1 * timestep_norm * dype_variance / (img_variance + 1e-8))
-                        
-                        # Apply frequency scaling to Y and X spatial coordinates only (not the index/sequence dimension)
-                        if enhanced_img_ids.shape[-1] >= 3:
-                            # Scale spatial positions to incorporate DyPE frequency adjustments
-                            enhanced_img_ids[..., 1:3] = enhanced_img_ids[..., 1:3] * freq_scale
+                    # PERFORMANCE OPTIMIZATION: Skip heavy computations for small images or when optimize=True
+                    if optimize:
+                        # For small images (< 64x64), use minimal processing
+                        if img_ids.numel() < 4096:  # Small image threshold
+                            enhanced_img_ids = img_ids.clone()
+                            # Only apply basic scaling for small images
+                            if hasattr(pe_embedder, 'current_timestep'):
+                                timestep_norm = pe_embedder.current_timestep
+                                if timestep_norm > 0.1:  # Only apply for significant timesteps
+                                    freq_scale = 1.0 + 0.02 * timestep_norm  # Lighter scaling for small images
+                                    enhanced_img_ids[..., 1:3] = enhanced_img_ids[..., 1:3] * freq_scale
+                        else:
+                            # Full processing for larger images
+                            enhanced_img_ids = _apply_dype_enhancement(img_ids, pe_embedder, debug)
+                    else:
+                        # Original full processing
+                        enhanced_img_ids = _apply_dype_enhancement(img_ids, pe_embedder, debug)
                     
                     # Replace the img_ids with DyPE-enhanced versions
                     # Handle both kwargs and args cases
@@ -134,12 +124,6 @@ def create_nunchaku_dype_wrapper(original_function, pe_embedder, enable_dype=Tru
                         args = list(args)
                         args[3] = enhanced_img_ids  # img_ids is typically the 4th argument
                         args = tuple(args)
-                    
-                    # Debug: Log embedding shape for high-resolution images
-                    if enhanced_img_ids.numel() > 10000:  # Large embeddings = high res
-                        _debug_print(f"🔧 Applied text-preserving DyPE: shape={enhanced_img_ids.shape}, "
-                              f"theta={pe_embedder.theta}, axes_dim={pe_embedder.axes_dim}, "
-                              f"max_pos={enhanced_img_ids.max().item():.2f}, freq_scale={freq_scale:.3f}")
                     
                 except Exception as e:
                     # Keep error logging for debugging purposes but make it conditional on debug flag
@@ -167,7 +151,7 @@ def create_nunchaku_dype_wrapper(original_function, pe_embedder, enable_dype=Tru
     return nunchaku_dype_wrapper
 
 
-def create_nunchaku_wrapper_forward_wrapper(wrapper_instance, pe_embedder, enable_dype=True, debug=False):
+def create_nunchaku_wrapper_forward_wrapper(wrapper_instance, pe_embedder, enable_dype=True, debug=False, optimize=True):
     """
     Create a wrapper for the ComfyFluxWrapper.forward method itself (the correct approach).
     
@@ -178,6 +162,7 @@ def create_nunchaku_wrapper_forward_wrapper(wrapper_instance, pe_embedder, enabl
         pe_embedder: The DyPE positional embedder
         enable_dype: Whether DyPE is enabled
         debug: Enable verbose debug logging (default: False for silent operation)
+        optimize: Enable performance optimizations (default: True)
     """
     # Update global debug flag for this wrapper instance
     global NUNCHAKU_DYPE_DEBUG
@@ -312,6 +297,56 @@ def get_dype_debug_mode():
     """
     global NUNCHAKU_DYPE_DEBUG
     return NUNCHAKU_DYPE_DEBUG
+
+
+def _apply_dype_enhancement(img_ids, pe_embedder, debug):
+    """
+    Optimized function to apply DyPE enhancement to img_ids.
+    
+    Args:
+        img_ids: The image IDs tensor
+        pe_embedder: The DyPE positional embedder
+        debug: Whether debug logging is enabled
+        
+    Returns:
+        Enhanced img_ids tensor
+    """
+    _debug_print(f"🔥 DyPE WRAPPER: Applying DyPE embeddings to img_ids")
+    
+    # Apply DyPE positional embeddings to the image IDs
+    dype_embeddings = pe_embedder(img_ids)
+    
+    # CRITICAL FIX: Properly inject DyPE embeddings into the positional encoding system
+    # Instead of keeping original img_ids, we enhance them with DyPE frequency adjustments
+    enhanced_img_ids = img_ids.clone()
+    
+    # Apply DyPE frequency scaling to maintain text-image alignment
+    if dype_embeddings.numel() == enhanced_img_ids.numel() * 2:  # cos/sin pairs
+        # Calculate frequency scaling based on DyPE timestep and embeddings
+        freq_scale = 1.0
+        if hasattr(pe_embedder, 'current_timestep'):
+            timestep_norm = pe_embedder.current_timestep
+            # Apply time-dependent frequency adjustment that preserves text conditioning
+            # The key is to scale positional frequencies while maintaining coordinate structure
+            base_freq = 1.0 + 0.05 * timestep_norm  # Conservative scaling
+            # Scale based on the actual DyPE embedding variance to avoid over-modification
+            dype_variance = dype_embeddings.var().item()
+            img_variance = enhanced_img_ids.var().item()
+            if img_variance > 0:
+                freq_scale = base_freq * (1.0 + 0.1 * timestep_norm * dype_variance / (img_variance + 1e-8))
+        
+        # Apply frequency scaling to Y and X spatial coordinates only (not the index/sequence dimension)
+        if enhanced_img_ids.shape[-1] >= 3:
+            # Scale spatial positions to incorporate DyPE frequency adjustments
+            enhanced_img_ids[..., 1:3] = enhanced_img_ids[..., 1:3] * freq_scale
+        
+        # Debug: Log embedding shape for high-resolution images
+        if enhanced_img_ids.numel() > 10000:  # Large embeddings = high res
+            _debug_print(f"🔧 Applied text-preserving DyPE: shape={enhanced_img_ids.shape}, "
+                  f"theta={pe_embedder.theta}, axes_dim={pe_embedder.axes_dim}, "
+                  f"max_pos={enhanced_img_ids.max().item():.2f}, freq_scale={freq_scale:.3f}")
+    
+    return enhanced_img_ids
 
 
 # Keep the old function name for backwards compatibility
